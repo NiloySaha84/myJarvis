@@ -1,0 +1,59 @@
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# python
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# notebooks
+.ipynb_checkpoints/
+
+# node / frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/release/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# local app logs
+*.log
+logs/
+
+# local auth / caches
+cache
+.cache/
+.DS_Store
+
+# knowledge/vector db output
+knowledge_chroma_db/
+knowledge_chroma_db.tmp/
+knowledge_chroma_db.bak/
+chroma/
+chroma_db/
+
+# generated icon scratch files
+frontend/build/icon.iconset/
+
+# os/editor
+.idea/
+.vscode/
+*.swp
+*.swo

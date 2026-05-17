@@ -1,0 +1,6 @@
+{
+  "index_version": 1,
+  "embedding_model": "local-hash-embeddings-v1",
+  "chunk_size": 1000,
+  "chunk_overlap": 200
+}

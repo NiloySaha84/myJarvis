@@ -1,0 +1,2 @@
+Memory Rule:
+If I say "focus mode", the agent should first open VS Code, then open my project folder, then summarize today's tasks briefly.

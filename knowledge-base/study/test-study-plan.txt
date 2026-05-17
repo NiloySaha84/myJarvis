@@ -1,0 +1,9 @@
+Study Plan: Learn Python Basics in 7 Days
+
+Step 1: Set up Python and VS Code.
+Step 2: Learn variables, data types, and operators.
+Step 3: Practice if/else and loops with small exercises.
+Step 4: Learn functions and modules.
+Step 5: Practice lists, dictionaries, and sets.
+Step 6: Build a mini project (CLI to-do app).
+Step 7: Review mistakes and revise key concepts.
