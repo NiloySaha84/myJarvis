@@ -1,202 +1,425 @@
 # MyJarvis
 
-MyJarvis is my local AI desktop assistant. I wanted to build something that feels closer to a real personal assistant than a normal chatbot: I can talk to it, it can talk back, it can control parts of my Mac, search through my own files, and use tools like Spotify.
+MyJarvis is a local AI desktop assistant built to feel closer to a real operating-system companion than a traditional chatbot. It listens, speaks, reasons through tasks, searches personal knowledge, controls parts of my Mac, and executes actions through tools.
 
-The main idea is simple: keep the assistant local to my laptop, but still give it useful agent abilities. The UI is a desktop app, the backend runs on my machine, and the agent can decide when it needs to call a tool instead of just replying with text.
+The core of the project is not the UI or the voice stack alone — it is the **agent architecture** inside `agent.py`. That is where natural language becomes decisions, tool execution, multi-step reasoning, and spoken responses.
 
-## What It Can Do
+---
 
-Right now MyJarvis can:
+# Core Architecture
 
-- listen through the microphone and respond with voice
-- answer typed messages from the desktop UI
-- control Spotify playback, playlists, queue, pause/resume, and song search
-- open apps, browsers, files, and folders on my Mac
-- create, rename, and copy files/folders
-- search my local knowledge base made of PDFs, text files, and markdown files
-- follow saved study/work setup steps from the knowledge base
-- rebuild its knowledge index when I add new files
-- run as a local FastAPI backend or as a packaged Mac desktop app
+At the center of MyJarvis is a **LangGraph agent loop** powered by **OpenAI (`gpt-4o-mini`)**.
 
-There are more smaller tools inside the project too, but the interesting part is how they are connected to the agent. I can ask for something in normal language, and the model decides whether it should answer directly or call one of the tools. If I save a workflow in the knowledge base, like "study mode" or "work mode", Jarvis can read those steps and then open the right apps, create the needed folders/files, and set up the environment for me.
+The model is connected to a controlled set of tools and runs inside a reasoning loop that allows it to:
 
-## Why I Built It
+- decide when tools are needed
+- execute one or multiple tools
+- read tool outputs
+- continue reasoning
+- produce a final spoken or typed response
 
-I wanted this project to be more than another chat UI around an API. A lot of assistant projects stop at "send prompt, get answer." MyJarvis is different because it connects speech, tool calling, local automation, and personal documents into one system.
+Instead of a single LLM call, MyJarvis behaves like a persistent decision-making system.
 
-It is also useful for me personally. I can use it as a voice assistant for music, local files, notes, study documents, and quick Mac actions.
+## Agent Execution Loop
 
-## Architecture
+```text
+START → agent (LLM) → should_continue?
+                          ├─ tool_calls? → tools → agent
+                          └─ no tools   → END
+```
 
-The project has four main parts:
+### Flow
 
-### 1. Desktop Frontend
+1. A user message enters the graph through `AgentState.messages`
+2. `model_call()` invokes the LLM with:
+   - system instructions
+   - conversation history
+   - available tools
+3. The graph checks whether the model requested any tool calls
+4. If tools are requested:
+   - `ToolNode` executes them
+   - results are appended as `ToolMessage`
+5. The graph loops back into the LLM so it can reason over tool output
+6. The cycle repeats until the model returns a normal response without pending tools
+7. `extract_final_text()` retrieves the final assistant reply for the UI or TTS
 
-The frontend is built with React and Vite, then wrapped with Electron so it can run like a normal Mac app.
+This architecture allows **multi-step execution chains** inside a single turn.
 
-The UI talks to the local backend through HTTP endpoints like:
+For example, Jarvis can:
 
-- `/chat`
-- `/health`
-- `/voice/start`
-- `/voice/stop`
-- `/voice/toggle-mute`
+```text
+query knowledge base
+    → retrieve saved workflow
+        → open apps
+        → start music
+        → organize windows
+        → respond verbally
+```
 
-The frontend also shows runtime status, activity logs, voice mode state, and whether the backend is online. Pressing the space bar in voice mode toggles mic mute/unmute.
+---
 
-### 2. Local FastAPI Backend
+# Voice-First System Design
 
-`server.py` is the bridge between the desktop app and the assistant runtime. It exposes the API used by the frontend and starts/stops the voice system.
+MyJarvis is designed primarily as a **voice assistant**, not a text chatbot.
 
-I kept this backend local-only because the project needs access to my microphone, speakers, Spotify auth, and macOS automation. Moving it fully to the cloud would make the most interesting parts harder or impossible without a local helper.
+The system prompt heavily shapes behavior:
 
-### 3. LangGraph Agent
+- replies stay short and conversational
+- responses are optimized for speech
+- the model must use tools for real-world actions
+- the assistant cannot pretend an action succeeded without a tool result
+- saved workflows must be retrieved from the knowledge base before execution
 
-`agent.py` is the core assistant. It uses LangGraph to create a loop like this:
+This keeps interactions natural while maintaining reliable tool behavior.
 
-1. user message comes in
-2. model decides whether to answer or call a tool
-3. tool runs if needed
-4. tool result goes back to the model
-5. final response is returned or spoken
+---
 
-This is the part that makes it feel like an agent instead of just a chatbot. The assistant has access to tools for Spotify, device actions, and local knowledge search, so it can actually do things.
+# Retrieval-Augmented Knowledge Base (RAG)
 
-### 4. Voice Pipeline
+One of the most important parts of the project is the local knowledge system in `tools/knowledgeTool.py`.
 
-The voice system has two parts:
+The assistant can search through personal files and use retrieved information as executable context.
 
-- `stt.py` streams microphone audio to Deepgram for speech-to-text
-- `tts.py` streams Deepgram text-to-speech audio back to the local speaker
+## Knowledge Pipeline
 
-The assistant also has echo handling so it does not keep hearing itself after it speaks. When Jarvis talks, the mic gets muted for a short time, then turns back on.
+Files inside `knowledge-base/` are:
 
-## Local Knowledge Base
+1. loaded
+2. chunked
+3. embedded
+4. stored in a local **Chroma vector database**
 
-The knowledge system lives in `tools/knowledgeTool.py`. It reads files from `knowledge-base/`, splits them into chunks, builds a Chroma vector index, and combines vector search with BM25 search.
+Retrieval combines multiple ranking methods:
 
-It can use local hash embeddings, Hugging Face embeddings, or OpenAI embeddings depending on the environment. I also added reranking with FlashRank when available.
+- semantic vector similarity
+- BM25 keyword retrieval
+- optional FlashRank reranking
 
-This is not only for Q&A. I can also put instructions in there for how I want a study session, coding session, or work session to start. For example, a file can say which apps to open, which folders to create, which notes to pull up, or what order to follow. When I ask Jarvis to start that mode, it searches the knowledge base first, finds the saved steps, and then uses its local tools to actually do them.
+The reranking stage improves retrieval quality by reordering candidate chunks based on relevance instead of relying only on embedding distance.
 
-That makes the knowledge base feel more like memory plus automation. It is not just storing facts; it can store routines that Jarvis can follow on my Mac.
+This produces significantly better results for:
+- saved workflows
+- setup instructions
+- study notes
+- project documentation
+- personal routines
 
-## Tech Stack
+## Executable Workflows
 
-Main tools used:
+The knowledge base is not treated as passive memory.
 
-- Python
-- FastAPI
-- LangGraph / LangChain
-- OpenAI
-- Deepgram STT/TTS
-- Chroma
-- BM25 + FlashRank
-- Spotipy
+The system prompt instructs the agent to:
+1. search the knowledge base first
+2. retrieve instructions/workflows
+3. execute them step-by-step using tools
+
+This allows MyJarvis to create complete environments automatically.
+
+For example:
+
+- “Start study mode”
+- “Set up my work environment”
+- “Open my AI research setup”
+
+If the steps exist in the knowledge base, Jarvis can:
+- open applications
+- launch browsers/tabs
+- organize files
+- start Spotify playlists
+- configure workflows
+- continue executing actions sequentially
+
+The result feels much closer to a real assistant than a Q&A chatbot.
+
+---
+
+# Streaming Voice Pipeline
+
+The assistant operates through a fully streaming speech pipeline.
+
+## Speech-to-Text (STT)
+
+`stt.py` streams microphone audio to **Deepgram** in real time.
+
+Pipeline:
+
+```text
+Microphone → Deepgram STT → final transcript
+```
+
+Final transcripts are sent into the LangGraph agent asynchronously.
+
+## Text-to-Speech (TTS)
+
+`tts.py` streams generated speech back through **Deepgram TTS**:
+
+```text
+LLM reply → Deepgram TTS → speaker output
+```
+
+Speech playback is streamed incrementally for low latency.
+
+---
+
+# Voice Interaction Engineering
+
+Building a reliable voice assistant required solving several real-world interaction problems.
+
+## Echo Prevention
+
+Without safeguards, the assistant would hear its own voice and recursively respond to itself.
+
+MyJarvis includes:
+- microphone muting during TTS playback
+- post-speech hold timing
+- transcript filtering
+- recent-response similarity checks
+
+Short transcripts matching Jarvis’s own reply are automatically ignored.
+
+---
+
+# Concurrency and Turn Safety
+
+Voice and UI requests share the same underlying agent.
+
+To prevent overlapping executions:
+
+- a global `turn_lock` ensures only one active agent turn exists
+- simultaneous requests are skipped or rejected
+- conversation history is shared across turns
+
+This avoids:
+- conflicting tool execution
+- overlapping TTS playback
+- race conditions in the graph loop
+
+---
+
+# Desktop Architecture
+
+## Frontend
+
+The desktop interface is built with:
+
 - React
 - Vite
 - Electron
-- macOS automation through `open` and `osascript`
 
-## Running It
+The UI communicates with the local backend through FastAPI endpoints such as:
 
-### Backend only
+```text
+/chat
+/voice/start
+/voice/stop
+/voice/toggle-mute
+```
 
-From the project root:
+The frontend provides:
+- live conversation display
+- runtime status
+- voice controls
+- activity logging
+
+---
+
+# Local Backend
+
+`server.py` acts as the bridge between:
+- the UI
+- the voice runtime
+- the LangGraph agent
+
+The backend stays fully local because the assistant depends on:
+- microphone access
+- speakers
+- Spotify authentication
+- macOS automation
+- local file access
+
+---
+
+# Tool-Using Agent
+
+The agent has access to tools for capabilities such as:
+
+- Spotify control
+- macOS automation
+- file and folder operations
+- browser/app launching
+- local knowledge retrieval
+- workflow execution
+
+Tools are implemented as LangChain `@tool` functions and executed through LangGraph’s `ToolNode`.
+
+The important part is not the tools themselves, but the agent’s ability to reason about:
+- when to use them
+- in what order
+- how to continue after receiving results
+
+---
+
+# End-to-End Voice Flow
+
+```text
+Mic
+ → Deepgram STT
+ → transcript
+ → LangGraph agent loop
+ → tool execution
+ → final response
+ → Deepgram TTS
+ → speaker
+```
+
+---
+
+# Tech Stack
+
+## Backend / AI
+
+- Python
+- FastAPI
+- LangGraph
+- LangChain
+- OpenAI
+- ChromaDB
+- BM25 retrieval
+- FlashRank reranking
+
+## Voice
+
+- Deepgram STT
+- Deepgram TTS
+
+## Desktop
+
+- React
+- Vite
+- Electron
+
+## Integrations
+
+- Spotipy
+- macOS automation (`open`, `osascript`)
+
+---
+
+# Running the Project
+
+## Backend
 
 ```bash
 uv run uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
-### Frontend in browser
+## Frontend
 
 ```bash
 cd frontend
 npm run dev
 ```
 
-Then open:
+Open:
 
 ```text
 http://127.0.0.1:5173
 ```
 
-### Electron desktop app
+## Electron Desktop App
 
 ```bash
 cd frontend
 npm run app
 ```
 
-### Build the clickable Mac app
+## Package macOS App
 
 ```bash
 cd frontend
 npm run package:mac
 ```
 
-The app will be created at:
+Output:
 
 ```text
 frontend/release/mac-arm64/MyJarvis.app
 ```
 
-## Environment Variables
+---
 
-The project expects a `.env` file with keys for the services I use.
+# Environment Variables
 
-Common ones:
+Create a `.env` file:
 
 ```text
 OPENAI_API_KEY=
-DpGram_API_KEY=
 DEEPGRAM_API_KEY=
 SPOTIFY_CLIENT_ID=
 SPOTIFY_CLIENT_SECRET=
 REDIRECT_URI=
 ```
 
-## Project Structure
+---
+
+# Project Structure
 
 ```text
 MyJarvis/
-  agent.py                  # main LangGraph agent
-  server.py                 # local FastAPI backend
-  stt.py                    # streaming speech-to-text
-  tts.py                    # streaming text-to-speech
-  audioManager.py           # macOS volume helper
+  agent.py
+  server.py
+  stt.py
+  tts.py
+  audioManager.py
+
   tools/
-    spotifyTool.py          # Spotify actions
-    deviceTool.py           # local Mac/file actions
-    knowledgeTool.py        # local document search
-  knowledge-base/           # my local notes/docs
+    spotifyTool.py
+    deviceTool.py
+    knowledgeTool.py
+
+  knowledge-base/
+
   frontend/
-    src/                    # React UI
-    electron/               # Electron app wrapper
+    src/
+    electron/
 ```
 
-## Current Status
+---
 
-This project is still in progress, but the main system is already working:
+# Current Status
 
-- desktop UI is working
-- local backend is working
-- voice mode is working
-- Spotify tools are working
-- local device tools are working
-- knowledge-base search is working
-- Mac app packaging is working
+## Working
 
-Things I still want to improve:
+- LangGraph agent loop
+- multi-step tool execution
+- streaming STT/TTS voice pipeline
+- local RAG knowledge base
+- reranking retrieval pipeline
+- desktop UI + Electron app
+- Spotify and macOS integrations
+- workflow execution from retrieved knowledge
 
-- better app icon and packaged app polish
-- more reliable startup flow
-- more structured results in the UI
-- tests for the backend tools
-- more desktop actions
+## In Progress
 
-## What I Learned
+- packaged app polish
+- richer structured frontend outputs
+- startup reliability improvements
+- expanded desktop automation
+- automated testing for tools and agent turns
 
-This project taught me a lot about building an actual agent system instead of just using an LLM API. The hardest parts were not only the model calls, but the real-time pieces around it: streaming audio, avoiding mic feedback, running local tools safely, keeping the desktop app connected to the backend, and making all of it feel usable.
+---
 
-MyJarvis is basically my attempt at building a personal AI assistant that is actually useful on my own machine.
+# What This Project Explores
+
+The most interesting challenge was not connecting APIs — it was building a system where:
+
+- retrieval
+- reasoning
+- tool execution
+- concurrency
+- voice interaction
+- and memory-like workflows
+
+all work together inside one continuous agent loop.
+
+MyJarvis is an attempt to build a local assistant that can actually operate as part of a real desktop workflow instead of only generating text.
