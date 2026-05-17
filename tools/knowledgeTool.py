@@ -3,6 +3,8 @@ import json
 import logging
 import os
 import shutil
+import time
+from collections import defaultdict
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -48,6 +50,36 @@ MANIFEST_FILE = "manifest.json"
 VECTOR_K = int(os.getenv("KNOWLEDGE_VECTOR_K", "12"))
 BM25_K = int(os.getenv("KNOWLEDGE_BM25_K", "12"))
 RERANK_TOP_N = int(os.getenv("KNOWLEDGE_RERANK_TOP_N", "5"))
+knowledge_metrics = defaultdict(int)
+knowledge_latency_metrics = {
+    "index_last_build_ms": 0.0,
+    "index_avg_build_ms": 0.0,
+    "query_last_latency_ms": 0.0,
+    "query_avg_latency_ms": 0.0,
+}
+
+
+def _inc_metric(name: str, value: int = 1) -> None:
+    knowledge_metrics[name] += value
+
+
+def _observe_latency(metric_key: str, avg_key: str, count_key: str, elapsed_ms: float) -> None:
+    knowledge_latency_metrics[metric_key] = round(elapsed_ms, 2)
+    count = knowledge_metrics.get(count_key, 0)
+    current_avg = knowledge_latency_metrics.get(avg_key, 0.0)
+    if count <= 0:
+        knowledge_latency_metrics[avg_key] = round(elapsed_ms, 2)
+        return
+    knowledge_latency_metrics[avg_key] = round(
+        ((current_avg * (count - 1)) + elapsed_ms) / count,
+        2,
+    )
+
+
+def get_knowledge_metrics() -> dict[str, Any]:
+    snapshot = dict(knowledge_metrics)
+    snapshot.update(knowledge_latency_metrics)
+    return snapshot
 
 
 def get_manifest_path(db_path: Path) -> Path:
@@ -173,8 +205,10 @@ def get_embeddings():
 
 
 def load_documents() -> list:
+    _inc_metric("load_documents_calls")
     base = Path(KNOWLEDGE_DIR)
     if not base.exists():
+        _inc_metric("knowledge_dir_missing")
         return []
 
     documents = []
@@ -185,6 +219,7 @@ def load_documents() -> list:
             doc.metadata["doc_type"] = "pdf"
             doc.metadata["source"] = pdf_path
             documents.append(doc)
+            _inc_metric("pdf_docs_loaded")
 
     for pattern in ("*.md", "*.txt"):
         for text_path in glob.glob(str(base / "**" / pattern), recursive=True):
@@ -193,22 +228,30 @@ def load_documents() -> list:
                 doc.metadata["doc_type"] = "text"
                 doc.metadata["source"] = text_path
                 documents.append(doc)
+                _inc_metric("text_docs_loaded")
 
+    _inc_metric("documents_loaded_total", len(documents))
     return documents
 
 
 def get_chunked_documents() -> list:
+    _inc_metric("chunk_requests")
     docs = load_documents()
     if not docs:
+        _inc_metric("chunk_requests_empty_docs")
         return []
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
     )
-    return splitter.split_documents(docs)
+    chunks = splitter.split_documents(docs)
+    _inc_metric("chunks_created_total", len(chunks))
+    return chunks
 
 
 def build_vectorstore(force_rebuild: bool = False) -> Chroma:
+    started = time.monotonic()
+    _inc_metric("vectorstore_build_calls")
     rebuild_flag = os.getenv("REBUILD_KNOWLEDGE_VECTOR_DB", "false").lower() == "true"
     rebuild = force_rebuild or rebuild_flag
 
@@ -221,6 +264,7 @@ def build_vectorstore(force_rebuild: bool = False) -> Chroma:
     current_manifest = load_manifest(db_path)
 
     if db_path.exists() and not rebuild and manifest_matches(current_manifest, embedding_name, source_state):
+        _inc_metric("vectorstore_reused_existing")
         log.info("Using existing knowledge DB at %s", db_path)
         return Chroma(
             persist_directory=str(db_path),
@@ -232,6 +276,7 @@ def build_vectorstore(force_rebuild: bool = False) -> Chroma:
 
     chunks = get_chunked_documents()
     if not chunks:
+        _inc_metric("vectorstore_build_failed_no_docs")
         raise ValueError(
             "No documents found in knowledge base. Add files under "
             f"'{KNOWLEDGE_DIR}' and rebuild."
@@ -258,11 +303,19 @@ def build_vectorstore(force_rebuild: bool = False) -> Chroma:
             shutil.rmtree(backup_path, ignore_errors=True)
 
         log.info("Knowledge vector DB built at %s", db_path)
+        _inc_metric("vectorstore_build_success")
+        _observe_latency(
+            "index_last_build_ms",
+            "index_avg_build_ms",
+            "vectorstore_build_success",
+            (time.monotonic() - started) * 1000,
+        )
         return Chroma(
             persist_directory=str(db_path),
             embedding_function=embeddings,
         )
     except Exception:
+        _inc_metric("vectorstore_build_failures")
         if temp_path.exists():
             shutil.rmtree(temp_path, ignore_errors=True)
         if backup_path.exists() and not db_path.exists():
@@ -279,13 +332,17 @@ def ensure_knowledge_index_up_to_date() -> None:
     current_state = get_source_state()
 
     if not db_path.exists() or not manifest_matches(manifest, embedding_name, current_state):
+        _inc_metric("index_auto_rebuild_triggered")
         clear_retriever_cache()
         build_vectorstore(force_rebuild=True)
         clear_retriever_cache()
+    else:
+        _inc_metric("index_already_fresh")
 
 
 @lru_cache(maxsize=1)
 def get_knowledge_retriever():
+    _inc_metric("retriever_build_calls")
     vectorstore = build_vectorstore()
     vector_retriever = vectorstore.as_retriever(search_kwargs={"k": VECTOR_K})
 
@@ -303,11 +360,13 @@ def get_knowledge_retriever():
 
     try:
         compressor = FlashrankRerank(client=Ranker(), top_n=RERANK_TOP_N)
+        _inc_metric("retriever_with_reranker")
         return ContextualCompressionRetriever(
             base_compressor=compressor,
             base_retriever=hybrid_retriever,
         )
     except Exception as exc:
+        _inc_metric("retriever_without_reranker")
         log.warning(
             "FlashRank reranker unavailable, using hybrid retriever without reranking: %s",
             exc,
@@ -320,6 +379,7 @@ def clear_retriever_cache() -> None:
 
 
 def rebuild_knowledge_index() -> str:
+    _inc_metric("manual_rebuild_requests")
     clear_retriever_cache()
     build_vectorstore(force_rebuild=True)
     clear_retriever_cache()
@@ -327,11 +387,21 @@ def rebuild_knowledge_index() -> str:
 
 
 def query_knowledge_base(query: str) -> str:
+    query_started = time.monotonic()
+    _inc_metric("query_calls")
     ensure_knowledge_index_up_to_date()
     retriever = get_knowledge_retriever()
     docs = retriever.invoke(query)
+    _inc_metric("query_docs_returned_total", len(docs or []))
 
     if not docs:
+        _inc_metric("query_no_results")
+        _observe_latency(
+            "query_last_latency_ms",
+            "query_avg_latency_ms",
+            "query_calls",
+            (time.monotonic() - query_started) * 1000,
+        )
         return (
             "I could not find relevant instructions in your knowledge base. "
             "Please add or update files in the knowledge-base folder."
@@ -346,6 +416,19 @@ def query_knowledge_base(query: str) -> str:
         chunks.append(f"[Source {idx}: {source}]\n{content}")
 
     if not chunks:
+        _inc_metric("query_results_without_text")
+        _observe_latency(
+            "query_last_latency_ms",
+            "query_avg_latency_ms",
+            "query_calls",
+            (time.monotonic() - query_started) * 1000,
+        )
         return "I found files, but they contained no readable text."
-
+    _inc_metric("query_results_with_text")
+    _observe_latency(
+        "query_last_latency_ms",
+        "query_avg_latency_ms",
+        "query_calls",
+        (time.monotonic() - query_started) * 1000,
+    )
     return "\n\n".join(chunks)

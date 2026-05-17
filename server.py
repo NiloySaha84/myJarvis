@@ -1,6 +1,8 @@
 import logging
 import os
 import threading
+import time
+from collections import defaultdict
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -8,11 +10,41 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
-from agent import process_text_turn, stt, tts
+from agent import get_agent_metrics, process_text_turn, spotify, stt, tts
+from tools.deviceTool import get_device_metrics
+from tools.knowledgeTool import get_knowledge_metrics
+from tools.newsTool import get_news_metrics
 
 
 log = logging.getLogger("JarvisAPI")
 STARTUP_GREETING = "Hello Niloy, What's the plan today"
+api_metrics = defaultdict(int)
+api_latency_ms = {
+    "http_last_latency_ms": 0.0,
+    "http_avg_latency_ms": 0.0,
+    "websocket_last_turn_latency_ms": 0.0,
+    "websocket_avg_turn_latency_ms": 0.0,
+}
+
+
+def _inc_metric(name: str, value: int = 1) -> None:
+    api_metrics[name] += value
+
+
+def _observe_latency(metric_key: str, avg_key: str, count_key: str, elapsed_ms: float) -> None:
+    api_latency_ms[metric_key] = round(elapsed_ms, 2)
+    count = api_metrics.get(count_key, 0)
+    current_avg = api_latency_ms.get(avg_key, 0.0)
+    if count <= 0:
+        api_latency_ms[avg_key] = round(elapsed_ms, 2)
+        return
+    api_latency_ms[avg_key] = round(((current_avg * (count - 1)) + elapsed_ms) / count, 2)
+
+
+def get_api_metrics() -> dict[str, Any]:
+    snapshot = dict(api_metrics)
+    snapshot.update(api_latency_ms)
+    return snapshot
 
 
 class ChatRequest(BaseModel):
@@ -57,10 +89,13 @@ app.add_middleware(
 
 
 def say_startup_greeting() -> None:
+    _inc_metric("startup_greeting_attempts")
     try:
         tts.start()
         tts.say(STARTUP_GREETING, wait=True, wait_timeout=30.0)
+        _inc_metric("startup_greeting_success")
     except Exception as exc:
+        _inc_metric("startup_greeting_failures")
         log.exception("Startup greeting failed: %s", exc)
 
 
@@ -77,32 +112,40 @@ def get_voice_status() -> dict[str, Any]:
     return {
         "stt": stt.get_health(),
         "stt_muted": stt.is_muted,
-        "tts_connected": tts.connection is not None,
+        "tts": tts.get_health(),
+        "tts_connected": tts.connection is not None,  # kept for frontend compatibility
     }
 
 
 def start_voice_runtime() -> dict[str, Any]:
+    _inc_metric("voice_runtime_start_calls")
     tts.start()
     stt.start()
     return get_voice_status()
 
 
 def stop_voice_runtime() -> dict[str, Any]:
+    _inc_metric("voice_runtime_stop_calls")
     stt.stop()
     tts.stop()
     return get_voice_status()
 
 
 def toggle_voice_mute() -> dict[str, Any]:
+    _inc_metric("voice_runtime_toggle_mute_calls")
     if stt.is_muted:
         stt.unmute()
+        _inc_metric("voice_runtime_unmute_success")
     else:
         stt.mute()
+        _inc_metric("voice_runtime_mute_success")
     return get_voice_status()
 
 
 def speak_reply(reply: str) -> None:
+    _inc_metric("speak_reply_calls")
     if not reply.strip():
+        _inc_metric("speak_reply_empty")
         return
 
     if tts.connection is None:
@@ -131,33 +174,65 @@ def root() -> dict[str, str]:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    _inc_metric("health_requests")
     return {
         "ok": True,
+        "api": get_api_metrics(),
         "voice": get_voice_status(),
+    }
+
+
+@app.get("/metrics")
+def metrics() -> dict[str, Any]:
+    _inc_metric("metrics_requests")
+    return {
+        "ok": True,
+        "api": get_api_metrics(),
+        "agent": get_agent_metrics(),
+        "stt": stt.get_health(),
+        "tts": tts.get_health(),
+        "knowledge": get_knowledge_metrics(),
+        "spotify": spotify.get_metrics(),
+        "device": get_device_metrics(),
+        "news": get_news_metrics(),
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest) -> ChatResponse:
+    request_started = time.monotonic()
+    _inc_metric("chat_requests_total")
     message = request.message.strip()
     if not message:
+        _inc_metric("chat_requests_bad_request")
         raise HTTPException(status_code=400, detail="Message cannot be empty.")
 
     try:
         reply = await run_in_threadpool(process_text_turn, message, False)
         if request.speak:
             await run_in_threadpool(speak_reply, reply)
+        _inc_metric("chat_requests_success")
     except RuntimeError as exc:
+        _inc_metric("chat_requests_conflict")
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception as exc:
+        _inc_metric("chat_requests_error")
         log.exception("Chat request failed: %s", exc)
         raise HTTPException(status_code=500, detail="Jarvis failed to respond.") from exc
+    finally:
+        _observe_latency(
+            "http_last_latency_ms",
+            "http_avg_latency_ms",
+            "chat_requests_total",
+            (time.monotonic() - request_started) * 1000,
+        )
 
     return ChatResponse(reply=reply, spoken=request.speak)
 
 
 @app.post("/voice/start")
 async def start_voice() -> dict[str, Any]:
+    _inc_metric("voice_start_requests")
     try:
         voice = await run_in_threadpool(start_voice_runtime)
     except Exception as exc:
@@ -169,6 +244,7 @@ async def start_voice() -> dict[str, Any]:
 
 @app.post("/voice/stop")
 async def stop_voice() -> dict[str, Any]:
+    _inc_metric("voice_stop_requests")
     try:
         voice = await run_in_threadpool(stop_voice_runtime)
     except Exception as exc:
@@ -180,6 +256,7 @@ async def stop_voice() -> dict[str, Any]:
 
 @app.post("/voice/toggle-mute")
 async def toggle_voice_mute_endpoint() -> dict[str, Any]:
+    _inc_metric("voice_toggle_mute_requests")
     try:
         voice = await run_in_threadpool(toggle_voice_mute)
     except Exception as exc:
@@ -191,11 +268,13 @@ async def toggle_voice_mute_endpoint() -> dict[str, Any]:
 
 @app.websocket("/ws")
 async def websocket_chat(websocket: WebSocket) -> None:
+    _inc_metric("websocket_connections_opened")
     await websocket.accept()
 
     try:
         while True:
             payload = await websocket.receive_json()
+            _inc_metric("websocket_messages_received")
             message = str(payload.get("message", "")).strip()
 
             if not message:
@@ -207,13 +286,23 @@ async def websocket_chat(websocket: WebSocket) -> None:
             await websocket.send_json({"type": "status", "status": "thinking"})
 
             try:
+                ws_turn_started = time.monotonic()
                 reply = await run_in_threadpool(process_text_turn, message, False)
                 if bool(payload.get("speak", False)):
                     await run_in_threadpool(speak_reply, reply)
+                _inc_metric("websocket_turn_success")
+                _observe_latency(
+                    "websocket_last_turn_latency_ms",
+                    "websocket_avg_turn_latency_ms",
+                    "websocket_turn_success",
+                    (time.monotonic() - ws_turn_started) * 1000,
+                )
             except RuntimeError as exc:
+                _inc_metric("websocket_turn_conflict")
                 await websocket.send_json({"type": "error", "detail": str(exc)})
                 continue
             except Exception as exc:
+                _inc_metric("websocket_turn_error")
                 log.exception("WebSocket chat failed: %s", exc)
                 await websocket.send_json(
                     {"type": "error", "detail": "Jarvis failed to respond."}
@@ -223,5 +312,7 @@ async def websocket_chat(websocket: WebSocket) -> None:
             await websocket.send_json(
                 {"type": "reply", "reply": reply, "spoken": bool(payload.get("speak", False))}
             )
+            _inc_metric("websocket_replies_sent")
     except WebSocketDisconnect:
+        _inc_metric("websocket_disconnects")
         log.info("Frontend WebSocket disconnected.")

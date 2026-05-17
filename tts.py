@@ -3,6 +3,7 @@ import time
 import threading
 import queue
 import logging
+from collections import defaultdict
 from typing import Optional
 
 import pyaudio
@@ -261,6 +262,38 @@ class RealTimeTTS:
             channels=self.channels,
             output_device_index=output_device_index,
         )
+        self.metrics = defaultdict(int)
+        self.metrics_lock = threading.Lock()
+        self.last_say_latency_ms = 0.0
+        self.avg_say_latency_ms = 0.0
+
+    def _inc_metric(self, name: str, value: int = 1) -> None:
+        with self.metrics_lock:
+            self.metrics[name] += value
+
+    def _observe_say_latency(self, elapsed_ms: float) -> None:
+        with self.metrics_lock:
+            self.last_say_latency_ms = round(elapsed_ms, 2)
+            count = self.metrics.get("say_requests_completed", 0)
+            if count <= 0:
+                self.avg_say_latency_ms = round(elapsed_ms, 2)
+                return
+            self.avg_say_latency_ms = round(
+                ((self.avg_say_latency_ms * (count - 1)) + elapsed_ms) / count,
+                2,
+            )
+
+    def get_health(self) -> dict:
+        with self.metrics_lock:
+            metrics = dict(self.metrics)
+            metrics["say_last_latency_ms"] = self.last_say_latency_ms
+            metrics["say_avg_latency_ms"] = self.avg_say_latency_ms
+        return {
+            "connected": self.connection is not None,
+            "ready": self.ready_event.is_set() and not self.connection_failed.is_set(),
+            "pending_flushes": self.pending_flushes,
+            "metrics": metrics,
+        }
 
     def build_speak_message(self, text: str):
         # deepgram sdk versions differ on this shape
@@ -271,9 +304,11 @@ class RealTimeTTS:
 
     def start(self) -> None:
         if self.thread is not None and self.thread.is_alive():
+            self._inc_metric("start_skipped_already_running")
             self.log.info("TTS is already running.")
             return
 
+        self._inc_metric("start_attempts")
         self.stop_event.clear()
         self.ready_event.clear()
         self.connection_failed.clear()
@@ -287,6 +322,7 @@ class RealTimeTTS:
                     sample_rate=self.sample_rate,
                 ) as connection:
                     self.connection = connection
+                    self._inc_metric("connection_opened")
 
                     connection.on(EventType.MESSAGE, self.on_message)
                     connection.on(EventType.ERROR, self.on_error)
@@ -298,10 +334,12 @@ class RealTimeTTS:
                     connection.start_listening()
 
             except BaseException as e:
+                self._inc_metric("connection_failures")
                 self.connection_error = e
                 self.connection_failed.set()
                 self.log.exception("TTS connection failed: %s", e)
             finally:
+                self._inc_metric("connection_closed")
                 self.connection = None
                 self.speaker.stop()
                 self.ready_event.set()
@@ -314,13 +352,16 @@ class RealTimeTTS:
         self.thread.start()
 
         if not self.ready_event.wait(timeout=10):
+            self._inc_metric("ready_wait_timeouts")
             raise TimeoutError("TTS connection did not become ready in time.")
 
         if self.connection_failed.is_set():
+            self._inc_metric("start_failed")
             err = self.connection_error or RuntimeError(
                 "Unknown TTS connection error"
             )
             raise err
+        self._inc_metric("start_completed")
 
     def say(
         self,
@@ -331,26 +372,37 @@ class RealTimeTTS:
     ) -> bool:
         """Speak text. wait=True blocks until audio finishes."""
         if not text or not text.strip():
+            self._inc_metric("say_empty_text")
             return True
 
         connection = self.connection
         if connection is None:
+            self._inc_metric("say_rejected_not_connected")
             raise RuntimeError("TTS is not connected yet. Call start() first.")
 
         # one sender at a time
+        say_started = time.monotonic()
+        self._inc_metric("say_requests_started")
         with self.send_lock:
             try:
                 connection.send_text(self.build_speak_message(text))
+                self._inc_metric("tts_text_messages_sent")
                 if flush:
                     with self.flush_lock:
                         self.pending_flushes += 1
                         self.all_flushed_event.clear()
                     connection.send_flush()
+                    self._inc_metric("tts_flush_messages_sent")
             except Exception as e:
+                self._inc_metric("say_requests_failed")
                 self.log.exception("Failed to send text to TTS: %s", e)
                 raise
 
+        self._inc_metric("say_requests_completed")
+        self._observe_say_latency((time.monotonic() - say_started) * 1000)
+
         if wait and flush:
+            self._inc_metric("say_wait_requests")
             return self.wait_for_idle(timeout=wait_timeout)
         return True
 
@@ -363,11 +415,13 @@ class RealTimeTTS:
 
         # deepgram done sending chunks
         if not self.all_flushed_event.wait(timeout=timeout):
+            self._inc_metric("wait_for_idle_timeout_on_flush")
             return False
 
         # our queue drained
         remaining = max(0.0, deadline - time.monotonic())
         if not self.speaker.drain(timeout=remaining):
+            self._inc_metric("wait_for_idle_timeout_on_drain")
             return False
 
         # device buffer + a little tail room
@@ -381,26 +435,32 @@ class RealTimeTTS:
     def on_message(self, message):
         try:
             if isinstance(message, (bytes, bytearray)):
+                self._inc_metric("audio_chunks_received")
                 self.log.debug("Got audio chunk: %d bytes", len(message))
                 self.speaker.play(bytes(message))
             else:
                 msg_type = getattr(message, "type", "Unknown")
                 self.log.debug("TTS event: %s", msg_type)
                 if msg_type == "Flushed":
+                    self._inc_metric("flush_events_received")
                     with self.flush_lock:
                         if self.pending_flushes > 0:
                             self.pending_flushes -= 1
                         if self.pending_flushes == 0:
                             self.all_flushed_event.set()
         except Exception as e:
+            self._inc_metric("on_message_errors")
             self.log.exception("Error while handling TTS message: %s", e)
 
     def on_error(self, error):
+        self._inc_metric("deepgram_error_events")
         self.log.error("TTS error: %s", error)
 
     def stop(self) -> None:
         if self.stop_event.is_set():
+            self._inc_metric("stop_skipped_already_stopped")
             return
+        self._inc_metric("stop_calls")
         self.stop_event.set()
 
         connection = self.connection

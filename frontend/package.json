@@ -71,6 +71,10 @@
       {
         "from": "../tools",
         "to": "backend/tools"
+      },
+      {
+        "from": "../knowledge-base",
+        "to": "backend/knowledge-base"
       }
     ],
     "mac": {

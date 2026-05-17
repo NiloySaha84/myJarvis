@@ -3,6 +3,7 @@ import re
 import time
 import threading
 import logging
+from collections import defaultdict
 from typing import Annotated, Optional, Sequence, TypedDict
 
 from dotenv import load_dotenv
@@ -282,6 +283,43 @@ def extract_final_text(state: dict) -> str:
 
 
 history = []
+history_lock = threading.Lock()
+
+agent_metrics = defaultdict(int)
+agent_metrics_lock = threading.Lock()
+agent_latency_metrics = {
+    "llm_last_latency_ms": 0.0,
+    "llm_avg_latency_ms": 0.0,
+    "turn_last_latency_ms": 0.0,
+    "turn_avg_latency_ms": 0.0,
+}
+
+
+def _inc_metric(name: str, value: int = 1) -> None:
+    with agent_metrics_lock:
+        agent_metrics[name] += value
+
+
+def _observe_latency(metric_key: str, avg_key: str, count_key: str, elapsed_ms: float) -> None:
+    with agent_metrics_lock:
+        agent_latency_metrics[metric_key] = round(elapsed_ms, 2)
+        count = agent_metrics.get(count_key, 0)
+        current_avg = agent_latency_metrics.get(avg_key, 0.0)
+        if count <= 0:
+            agent_latency_metrics[avg_key] = round(elapsed_ms, 2)
+            return
+        new_avg = ((current_avg * (count - 1)) + elapsed_ms) / count
+        agent_latency_metrics[avg_key] = round(new_avg, 2)
+
+
+def get_agent_metrics() -> dict:
+    with agent_metrics_lock, history_lock:
+        snapshot = dict(agent_metrics)
+        snapshot.update(agent_latency_metrics)
+        snapshot["conversation_turns"] = len(history) // 2
+        snapshot["history_messages"] = len(history)
+        snapshot["turn_lock_locked"] = turn_lock.locked()
+        return snapshot
 
 # TRACE_TOOL_CALLS=0 to hide tool logs
 TRACE_TOOL_CALLS = os.getenv("TRACE_TOOL_CALLS", "1") not in ("0", "false", "False", "")
@@ -327,17 +365,22 @@ def log_new_messages(messages, seen_ids: set) -> None:
             for tc in tool_calls:
                 name = tc.get("name", "?") if isinstance(tc, dict) else getattr(tc, "name", "?")
                 args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
+                _inc_metric("tool_calls_requested")
                 log.info("→ tool call: %s(%s)", name, format_tool_args(args))
         elif isinstance(msg, ToolMessage):
             name = getattr(msg, "name", None) or "?"
             content = stringify_content(msg.content)
+            _inc_metric("tool_results_received")
             if len(content) > TOOL_RESULT_LOG_LIMIT:
                 content = content[:TOOL_RESULT_LOG_LIMIT] + "...(truncated)"
             log.info("← tool result [%s]: %s", name, content)
 
 
 def call_llm(text: str) -> str:
-    history.append(("user", text))
+    llm_started = time.monotonic()
+    _inc_metric("llm_requests_started")
+    with history_lock:
+        history.append(("user", text))
     input_data = {"messages": history}
 
     final_state = None
@@ -348,7 +391,13 @@ def call_llm(text: str) -> str:
             log_new_messages(chunk.get("messages", []), seen_ids)
 
     reply = extract_final_text(final_state)
-    history.append(("assistant", reply))
+    with history_lock:
+        history.append(("assistant", reply))
+    _inc_metric("llm_requests_completed")
+    if not reply:
+        _inc_metric("llm_empty_replies")
+    llm_elapsed_ms = (time.monotonic() - llm_started) * 1000
+    _observe_latency("llm_last_latency_ms", "llm_avg_latency_ms", "llm_requests_completed", llm_elapsed_ms)
     return reply
 
 
@@ -360,17 +409,27 @@ def process_text_turn(text: str, block: bool = False) -> str:
     """Text turn for the web UI (no mic)."""
     cleaned = (text or "").strip()
     if not cleaned:
+        _inc_metric("text_turns_empty")
         return ""
 
     if not turn_lock.acquire(blocking=block):
+        _inc_metric("turn_lock_rejections")
         raise RuntimeError("Another Jarvis turn is already in progress.")
 
+    turn_started = time.monotonic()
+    _inc_metric("text_turns_started")
     try:
         log.info("User said: %s", cleaned)
         reply = call_llm(cleaned)
         log.info("Jarvis: %s", reply)
+        _inc_metric("text_turns_completed")
         return reply
+    except Exception:
+        _inc_metric("text_turns_failed")
+        raise
     finally:
+        turn_elapsed_ms = (time.monotonic() - turn_started) * 1000
+        _observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "text_turns_completed", turn_elapsed_ms)
         turn_lock.release()
 
 # extra mute after TTS so room echo doesn't trigger STT
@@ -413,20 +472,26 @@ def process_turn(text: str) -> None:
     global last_reply, last_reply_time
 
     if not turn_lock.acquire(blocking=False):
+        _inc_metric("voice_turns_skipped_busy")
         log.info("Skipping new turn — previous turn still in progress.")
         return
+    turn_started = time.monotonic()
+    _inc_metric("voice_turns_started")
     try:
         log.info("User said: %s", text)
         try:
             reply = call_llm(text)
         except Exception as e:
+            _inc_metric("voice_turns_failed")
             log.exception("LLM call failed: %s", e)
             reply = "Sorry, something went wrong handling that."
 
         if not reply:
+            _inc_metric("voice_turns_empty_reply")
             log.info("LLM produced no spoken reply.")
             return
 
+        _inc_metric("voice_turns_completed")
         log.info("Jarvis: %s", reply)
 
         with last_reply_lock:
@@ -435,32 +500,43 @@ def process_turn(text: str) -> None:
 
         # mute mic while jarvis talks so we don't loop
         stt.mute()
+        _inc_metric("stt_muted_for_tts")
         try:
             tts.say(reply, wait=True, wait_timeout=30.0)
+            _inc_metric("tts_speak_requests")
         except Exception as e:
+            _inc_metric("tts_speak_failures")
             log.exception("TTS playback failed: %s", e)
         finally:
             time.sleep(POST_SPEECH_MUTE_HOLD)
             with last_reply_lock:
                 last_reply_time = time.monotonic()
             stt.unmute()
+            _inc_metric("stt_unmuted_after_tts")
     finally:
+        turn_elapsed_ms = (time.monotonic() - turn_started) * 1000
+        _observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "voice_turns_completed", turn_elapsed_ms)
         turn_lock.release()
 
 
 def handle_final(text: str) -> None:
     """STT finished a phrase — don't block here."""
+    _inc_metric("stt_final_callbacks")
     if not text or not text.strip():
+        _inc_metric("stt_final_empty")
         return
     if stt.is_muted:
+        _inc_metric("stt_final_dropped_muted")
         log.debug("Dropping transcript received while muted: %s", text)
         return
 
     cleaned = text.strip()
     if looks_like_echo(cleaned):
+        _inc_metric("stt_final_dropped_echo")
         log.info("Dropping suspected echo of Jarvis's reply: %s", cleaned)
         return
 
+    _inc_metric("stt_final_dispatched")
     threading.Thread(
         target=process_turn,
         args=(cleaned,),
