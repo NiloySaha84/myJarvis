@@ -201,6 +201,22 @@ This avoids:
 - overlapping TTS playback
 - race conditions in the graph loop
 
+## Locking model (pessimistic, not optimistic)
+
+MyJarvis uses **pessimistic** concurrency control: shared resources are guarded *before* work runs, not retried after a conflict is detected.
+
+This is **not** optimistic locking (read → work without a lock → commit only if nothing changed → retry on conflict).
+
+| Layer | Mechanism | Role |
+|-------|-----------|------|
+| **Agent** (`agent.py`) | `turn_lock` (`threading.Lock`) | Only one LLM/tool turn at a time; voice turns skip if busy, text `/chat` can reject with `409` |
+| **Agent** | `history_lock`, `last_reply_lock` | Safe updates to conversation history and echo-filter state |
+| **TTS** (`tts.py`) | `send_lock` | One Deepgram TTS sender at a time |
+| **TTS** | `Speaker.lock`, `flush_lock`, `metrics_lock` | Safe speaker startup, flush counting, and metrics |
+| **STT** (`stt.py`) | `mute_event`, `stop_event` | Cooperative gating: mic audio is dropped while muted or stopped (not a version/retry model) |
+
+STT does not use optimistic locking either; it uses **event-based synchronization** so the mic callback never sends audio while Jarvis is speaking or the stream is shutting down.
+
 ---
 
 # Desktop Architecture
