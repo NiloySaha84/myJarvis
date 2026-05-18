@@ -67,7 +67,7 @@ HEALTH_CHECK_INTERVAL = 5
 
 # tts
 TTS_API_KEY = os.getenv("DpGram_API_KEY") or os.getenv("DEEPGRAM_API_KEY")
-TTS_MODEL = "aura-2-apollo-en"
+TTS_MODEL = "aura-2-helena-en"
 TTS_SAMPLE_RATE = 48000
 TTS_CHANNELS = 1
 
