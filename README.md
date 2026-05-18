@@ -4,6 +4,8 @@ MyJarvis is a local AI desktop assistant built to feel closer to a real operatin
 
 The core of the project is not the UI or the voice stack alone — it is the **agent architecture** inside `agent.py`. That is where natural language becomes decisions, tool execution, multi-step reasoning, and spoken responses.
 
+## Live Demo: https://niloy-saha84-github-io.vercel.app/myJarvis.mp4
+
 ---
 
 # Core Architecture
