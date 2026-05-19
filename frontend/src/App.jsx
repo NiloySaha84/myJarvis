@@ -7,11 +7,9 @@ import {
   Clock3,
   Cpu,
   Database,
-  FolderCog,
   Loader2,
   Mic,
   MicOff,
-  Music2,
   Power,
   RefreshCw,
   Send,
@@ -27,6 +25,8 @@ import {
 
 const API_BASE_URL = import.meta.env.VITE_JARVIS_API_URL ?? "http://127.0.0.1:8000";
 const MAX_ACTIVITY_ITEMS = 10;
+const SYSTEM_POLL_INTERVAL_MS = 1000;
+const ELECTRON_LOG_POLL_INTERVAL_MS = 2000;
 
 const initialMessages = [
   {
@@ -45,13 +45,6 @@ const initialActivity = [
     status: "ready",
     time: "now",
   },
-];
-
-const integrations = [
-  ["Spotify", "Search, queue, playback, and playlist control.", Music2],
-  ["Desktop actions", "Open apps, browsers, files, and folders on macOS.", FolderCog],
-  ["Knowledge base", "Hybrid search over local PDF, Markdown, and text files.", Database],
-  ["Voice runtime", "Deepgram streaming STT and TTS through the Python backend.", Mic],
 ];
 
 function getTimestamp() {
@@ -82,6 +75,23 @@ function createActivity(title, detail, status = "ready") {
   };
 }
 
+function formatRate(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond < 0) return "n/a";
+  if (bytesPerSecond < 1024) return `${Math.round(bytesPerSecond)} B/s`;
+  if (bytesPerSecond < 1024 * 1024) return `${(bytesPerSecond / 1024).toFixed(1)} KB/s`;
+  return `${(bytesPerSecond / (1024 * 1024)).toFixed(2)} MB/s`;
+}
+
+function formatUptime(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return "n/a";
+  const total = Math.floor(seconds);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  if (days > 0) return `${days}d ${hours}h ${minutes}m`;
+  return `${hours}h ${minutes}m`;
+}
+
 function App() {
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
@@ -92,6 +102,10 @@ function App() {
   const [activityLog, setActivityLog] = useState(initialActivity);
   const [runtimeHealth, setRuntimeHealth] = useState(null);
   const [healthError, setHealthError] = useState("");
+  const [systemLive, setSystemLive] = useState(null);
+  const [systemError, setSystemError] = useState("");
+  const [electronLogLines, setElectronLogLines] = useState([]);
+  const [electronLogsError, setElectronLogsError] = useState("");
   const inputRef = useRef(null);
 
   function pushActivity(item) {
@@ -123,9 +137,57 @@ function App() {
     }
   }
 
+  async function refreshSystemLive({ silent = true } = {}) {
+    try {
+      const payload = await requestJson("/system/live");
+      setSystemLive(payload.system ?? null);
+      setSystemError("");
+      if (!silent) {
+        pushActivity(createActivity("System snapshot", "Backend responded from /system/live.", "complete"));
+      }
+    } catch (error) {
+      setSystemError(error.message);
+      if (!silent) {
+        pushActivity(createActivity("System snapshot failed", error.message, "error"));
+      }
+    }
+  }
+
+  async function refreshElectronLogs({ silent = true } = {}) {
+    try {
+      const payload = await requestJson("/logs/electron?lines=80");
+      const lines = Array.isArray(payload.lines) ? payload.lines : [];
+      setElectronLogLines(lines);
+      setElectronLogsError(payload.exists ? "" : "Electron log file not found yet.");
+      if (!silent) {
+        pushActivity(createActivity("Electron logs", "Fetched latest Electron log tail.", "complete"));
+      }
+    } catch (error) {
+      setElectronLogsError(error.message);
+      if (!silent) {
+        pushActivity(createActivity("Electron logs failed", error.message, "error"));
+      }
+    }
+  }
+
   useEffect(() => {
     refreshHealth({ silent: true });
     const timer = window.setInterval(() => refreshHealth({ silent: true }), 10000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    refreshSystemLive({ silent: true });
+    const timer = window.setInterval(() => refreshSystemLive({ silent: true }), SYSTEM_POLL_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    refreshElectronLogs({ silent: true });
+    const timer = window.setInterval(
+      () => refreshElectronLogs({ silent: true }),
+      ELECTRON_LOG_POLL_INTERVAL_MS,
+    );
     return () => window.clearInterval(timer);
   }, []);
 
@@ -198,7 +260,7 @@ function App() {
 
     try {
       const health = await requestJson(endpoint, { method: "POST" });
-      setRuntimeHealth({ ok: true, voice: health.voice });
+      setRuntimeHealth((current) => ({ ...(current ?? {}), ok: true, voice: health.voice }));
       setHealthError("");
       setIsVoiceMode(nextVoiceMode);
       updateActivity(voiceEvent.id, {
@@ -224,7 +286,7 @@ function App() {
 
     try {
       const result = await requestJson("/voice/toggle-mute", { method: "POST" });
-      setRuntimeHealth({ ok: true, voice: result.voice });
+      setRuntimeHealth((current) => ({ ...(current ?? {}), ok: true, voice: result.voice }));
       setHealthError("");
       updateActivity(muteEvent.id, {
         status: "complete",
@@ -335,7 +397,7 @@ function App() {
           statusText={statusText}
         />
 
-        <IntegrationSummary />
+        <TopSystemStats systemLive={systemLive} systemError={systemError} />
 
         <section className="grid flex-1 grid-cols-1 gap-4 xl:grid-cols-[320px_minmax(0,1fr)_320px]">
           <RuntimePanel
@@ -358,6 +420,8 @@ function App() {
           />
           <ActivityPanel
             events={activityLog}
+            electronLogLines={electronLogLines}
+            electronLogsError={electronLogsError}
             isThinking={isThinking}
             isVoiceMode={isVoiceMode}
           />
@@ -408,23 +472,73 @@ function StatusPill({ icon: Icon, label, active = false }) {
   );
 }
 
-function IntegrationSummary() {
+function TopSystemStats({ systemLive, systemError }) {
+  const cpuPercent = Number(systemLive?.cpu?.percent ?? NaN);
+  const memoryPercent = Number(systemLive?.memory?.percent ?? NaN);
+  const diskPercent = Number(systemLive?.disk?.percent ?? NaN);
+  const cpuStatus = Number.isFinite(cpuPercent) && cpuPercent >= 85 ? "error" : "running";
+  const memoryStatus = Number.isFinite(memoryPercent) && memoryPercent >= 85 ? "error" : "running";
+  const diskStatus = Number.isFinite(diskPercent) && diskPercent >= 90 ? "error" : "running";
+
+  const cards = [
+    {
+      label: "CPU",
+      value: Number.isFinite(cpuPercent) ? `${cpuPercent.toFixed(1)}%` : "n/a",
+      detail: systemLive
+        ? `Load(1m) ${systemLive?.cpu?.load_avg?.["1m"] ?? "n/a"} • ${systemLive?.cpu?.logical_cores ?? "n/a"} cores`
+        : systemError || "Waiting for live system metrics...",
+      status: systemLive ? cpuStatus : "ready",
+      icon: Cpu,
+    },
+    {
+      label: "Memory",
+      value: Number.isFinite(memoryPercent) ? `${memoryPercent.toFixed(1)}%` : "n/a",
+      detail: systemLive
+        ? `${systemLive?.memory?.used_gb ?? "n/a"}GB / ${systemLive?.memory?.total_gb ?? "n/a"}GB in use`
+        : systemError || "Waiting for live system metrics...",
+      status: systemLive ? memoryStatus : "ready",
+      icon: Database,
+    },
+    {
+      label: "Disk",
+      value: Number.isFinite(diskPercent) ? `${diskPercent.toFixed(1)}%` : "n/a",
+      detail: systemLive
+        ? `${systemLive?.disk?.used_gb ?? "n/a"}GB / ${systemLive?.disk?.total_gb ?? "n/a"}GB used`
+        : systemError || "Waiting for live system metrics...",
+      status: systemLive ? diskStatus : "ready",
+      icon: Server,
+    },
+    {
+      label: "Network",
+      value: systemLive
+        ? `↑ ${formatRate(systemLive?.network?.upload_bps)} • ↓ ${formatRate(systemLive?.network?.download_bps)}`
+        : "n/a",
+      detail: systemLive
+        ? `${systemLive?.host?.hostname ?? "unknown host"} • Uptime ${formatUptime(systemLive?.uptime_seconds)} • stale ${systemLive?.stale_ms ?? 0}ms`
+        : systemError || "Waiting for live system metrics...",
+      status: systemLive ? "running" : "ready",
+      icon: Activity,
+    },
+  ];
+
   return (
     <section className="glass-panel px-5 py-4">
+      <div className="mb-3 flex items-center gap-2 text-sm font-medium text-white">
+        <Cpu className="h-4 w-4 text-cyan-200" />
+        System stats
+      </div>
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        {integrations.map(([title, detail, Icon]) => (
-          <div
-            key={title}
-            className="rounded-3xl border border-cyan-200/10 bg-white/[0.03] p-4"
-          >
-            <div className="mb-3 flex items-center gap-2 text-sm font-medium text-white">
-              <Icon className="h-4 w-4 text-cyan-200" />
-              {title}
-            </div>
-            <p className="text-sm leading-6 text-slate-400">{detail}</p>
+        {cards.map((card) => (
+          <div key={card.label} className="min-w-0">
+            <RuntimeCard {...card} />
           </div>
         ))}
       </div>
+      {!systemLive && systemError && (
+        <div className="mt-3 rounded-2xl border border-red-300/20 bg-red-500/10 p-3 text-xs text-red-100">
+          {systemError}
+        </div>
+      )}
     </section>
   );
 }
@@ -597,7 +711,7 @@ function ConversationView({
   );
 }
 
-function ActivityPanel({ events, isThinking, isVoiceMode }) {
+function ActivityPanel({ events, isThinking, isVoiceMode, electronLogLines, electronLogsError }) {
   return (
     <aside className="glass-panel panel-height order-3 flex flex-col p-4">
       <TerminalSquare className="mb-3 h-5 w-5 text-cyan-200" />
@@ -607,6 +721,28 @@ function ActivityPanel({ events, isThinking, isVoiceMode }) {
         {events.map((event) => (
           <ActivityItem key={event.id} event={event} />
         ))}
+      </div>
+
+      <div className="mt-4 rounded-3xl border border-cyan-200/10 bg-slate-950/60 p-4">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-xs uppercase tracking-[0.3em] text-cyan-200/70">Electron logs</p>
+          <span className="text-[11px] text-slate-500">live tail</span>
+        </div>
+        {electronLogsError ? (
+          <p className="text-xs text-red-200">{electronLogsError}</p>
+        ) : (
+          <div className="max-h-44 overflow-y-auto rounded-xl border border-cyan-200/10 bg-black/30 p-2 font-mono text-[11px] leading-5 text-cyan-100/90">
+            {electronLogLines.length > 0 ? (
+              electronLogLines.map((line, index) => (
+                <div key={`${index}-${line.slice(0, 24)}`} className="whitespace-pre-wrap break-words">
+                  {line}
+                </div>
+              ))
+            ) : (
+              <div className="text-slate-500">No log lines yet.</div>
+            )}
+          </div>
+        )}
       </div>
 
       <div className="mt-auto rounded-3xl border border-cyan-200/10 bg-slate-950/60 p-4">

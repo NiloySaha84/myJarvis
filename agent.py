@@ -32,6 +32,7 @@ from tools.deviceTool import (
     copy_file,
 )
 from tools.knowledgeTool import rebuild_knowledge_index, query_knowledge_base
+from tools.systemTool import get_live_core_system_data
 
 load_dotenv()
 
@@ -67,10 +68,9 @@ HEALTH_CHECK_INTERVAL = 5
 
 # tts
 TTS_API_KEY = os.getenv("DpGram_API_KEY") or os.getenv("DEEPGRAM_API_KEY")
-TTS_MODEL = "aura-2-helena-en"
+TTS_MODEL = "aura-2-jupiter-en"
 TTS_SAMPLE_RATE = 48000
 TTS_CHANNELS = 1
-
 
 class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
@@ -196,6 +196,12 @@ def rebuild_uploaded_knowledge_db():
     return rebuild_knowledge_index()
 
 
+@tool
+def get_live_system_data():
+    """Get real-time core system stats like CPU, memory, disk, network, and uptime."""
+    return get_live_core_system_data()
+
+
 tools = [
     get_user_playlists,
     play_next,
@@ -218,18 +224,41 @@ tools = [
     copy_this_file,
     query_uploaded_knowledge,
     rebuild_uploaded_knowledge_db,
+    get_live_system_data,
 ]
 model = ChatOpenAI(model=MODEL, temperature=0).bind_tools(tools)
 
 SYSTEM_PROMPT = (
-    "You are Jarvis, a concise voice-first assistant. "
-    "Your replies are spoken out loud, so keep them short, natural, and "
-    "conversational — one or two sentences whenever possible, no markdown, "
-    "no lists, no code blocks. Confirm completed actions briefly."
-    "Speak in a natural, conversational tone. Use a friendly, engaging voice like you are a human."
-    "For any action that requires external execution, you must call the tool (if appropriate tool is available). Do not claim completion unless the tool result is present."
-    "When a user asks anything that may depend on remembered instructions, personal rules, workflows, or notes saved in the knowledge base, call query_uploaded_knowledge first and then answer based on its output."
-    "If the retrieved knowledge describes a sequence of actions, follow that sequence and call the required tools in order."
+    """
+    You are Jarvis, an advanced AI assistant inspired by Tony Stark’s J.A.R.V.I.S.
+
+    Your personality is calm, intelligent, efficient, and subtly witty. You speak with confidence, precision, and composure. Your tone should feel sophisticated and conversational, robotic, but never overly verbose. You are highly capable, attentive, and proactive without sounding dramatic.
+
+    Keep responses concise and voice-friendly. Avoid long explanations unless the user explicitly asks for detail. Do not use bullet points, numbered lists, or code blocks unless specifically requested.
+
+    Speak naturally, like a trusted AI companion integrated into the user’s environment. Use smooth conversational phrasing and occasional light dry humor when appropriate, but never overdo it.
+
+    When an action requires external execution, tool usage, or system interaction, you must call the appropriate tool if available. Never claim an action was completed unless the tool result confirms it.
+
+    When the user asks something that may depend on stored memory, saved workflows, preferences, instructions, or uploaded knowledge, first call query_uploaded_knowledge and use its results before answering.
+
+    If retrieved knowledge contains a sequence of actions or operational procedures, follow them exactly and execute the required tools in order.
+
+    Acknowledge completed actions briefly and naturally. Examples:
+    “Done.”
+    “Handled.”
+    “That’s been taken care of.”
+    “Already on it.”
+    “Task completed.”
+
+    Avoid repetitive assistant phrases like:
+    “How can I help you today?”
+    “Let me know if you need anything else.”
+    "What would you do next?" and similar phrases after a tool call.
+
+    Your goal is to feel like a seamless operating-system-level AI companion: capable, composed, observant, and efficient.
+    Be Authoritative and confident in your responses.
+    """
 )
 
 
@@ -295,12 +324,12 @@ agent_latency_metrics = {
 }
 
 
-def _inc_metric(name: str, value: int = 1) -> None:
+def inc_metric(name: str, value: int = 1) -> None:
     with agent_metrics_lock:
         agent_metrics[name] += value
 
 
-def _observe_latency(metric_key: str, avg_key: str, count_key: str, elapsed_ms: float) -> None:
+def observe_latency(metric_key: str, avg_key: str, count_key: str, elapsed_ms: float) -> None:
     with agent_metrics_lock:
         agent_latency_metrics[metric_key] = round(elapsed_ms, 2)
         count = agent_metrics.get(count_key, 0)
@@ -365,12 +394,12 @@ def log_new_messages(messages, seen_ids: set) -> None:
             for tc in tool_calls:
                 name = tc.get("name", "?") if isinstance(tc, dict) else getattr(tc, "name", "?")
                 args = tc.get("args", {}) if isinstance(tc, dict) else getattr(tc, "args", {})
-                _inc_metric("tool_calls_requested")
+                inc_metric("tool_calls_requested")
                 log.info("→ tool call: %s(%s)", name, format_tool_args(args))
         elif isinstance(msg, ToolMessage):
             name = getattr(msg, "name", None) or "?"
             content = stringify_content(msg.content)
-            _inc_metric("tool_results_received")
+            inc_metric("tool_results_received")
             if len(content) > TOOL_RESULT_LOG_LIMIT:
                 content = content[:TOOL_RESULT_LOG_LIMIT] + "...(truncated)"
             log.info("← tool result [%s]: %s", name, content)
@@ -378,7 +407,7 @@ def log_new_messages(messages, seen_ids: set) -> None:
 
 def call_llm(text: str) -> str:
     llm_started = time.monotonic()
-    _inc_metric("llm_requests_started")
+    inc_metric("llm_requests_started")
     with history_lock:
         history.append(("user", text))
     input_data = {"messages": history}
@@ -393,11 +422,11 @@ def call_llm(text: str) -> str:
     reply = extract_final_text(final_state)
     with history_lock:
         history.append(("assistant", reply))
-    _inc_metric("llm_requests_completed")
+    inc_metric("llm_requests_completed")
     if not reply:
-        _inc_metric("llm_empty_replies")
+        inc_metric("llm_empty_replies")
     llm_elapsed_ms = (time.monotonic() - llm_started) * 1000
-    _observe_latency("llm_last_latency_ms", "llm_avg_latency_ms", "llm_requests_completed", llm_elapsed_ms)
+    observe_latency("llm_last_latency_ms", "llm_avg_latency_ms", "llm_requests_completed", llm_elapsed_ms)
     return reply
 
 
@@ -409,27 +438,27 @@ def process_text_turn(text: str, block: bool = False) -> str:
     """Text turn for the web UI (no mic)."""
     cleaned = (text or "").strip()
     if not cleaned:
-        _inc_metric("text_turns_empty")
+        inc_metric("text_turns_empty")
         return ""
 
     if not turn_lock.acquire(blocking=block):
-        _inc_metric("turn_lock_rejections")
+        inc_metric("turn_lock_rejections")
         raise RuntimeError("Another Jarvis turn is already in progress.")
 
     turn_started = time.monotonic()
-    _inc_metric("text_turns_started")
+    inc_metric("text_turns_started")
     try:
         log.info("User said: %s", cleaned)
         reply = call_llm(cleaned)
         log.info("Jarvis: %s", reply)
-        _inc_metric("text_turns_completed")
+        inc_metric("text_turns_completed")
         return reply
     except Exception:
-        _inc_metric("text_turns_failed")
+        inc_metric("text_turns_failed")
         raise
     finally:
         turn_elapsed_ms = (time.monotonic() - turn_started) * 1000
-        _observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "text_turns_completed", turn_elapsed_ms)
+        observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "text_turns_completed", turn_elapsed_ms)
         turn_lock.release()
 
 # extra mute after TTS so room echo doesn't trigger STT
@@ -472,26 +501,26 @@ def process_turn(text: str) -> None:
     global last_reply, last_reply_time
 
     if not turn_lock.acquire(blocking=False):
-        _inc_metric("voice_turns_skipped_busy")
+        inc_metric("voice_turns_skipped_busy")
         log.info("Skipping new turn — previous turn still in progress.")
         return
     turn_started = time.monotonic()
-    _inc_metric("voice_turns_started")
+    inc_metric("voice_turns_started")
     try:
         log.info("User said: %s", text)
         try:
             reply = call_llm(text)
         except Exception as e:
-            _inc_metric("voice_turns_failed")
+            inc_metric("voice_turns_failed")
             log.exception("LLM call failed: %s", e)
             reply = "Sorry, something went wrong handling that."
 
         if not reply:
-            _inc_metric("voice_turns_empty_reply")
+            inc_metric("voice_turns_empty_reply")
             log.info("LLM produced no spoken reply.")
             return
 
-        _inc_metric("voice_turns_completed")
+        inc_metric("voice_turns_completed")
         log.info("Jarvis: %s", reply)
 
         with last_reply_lock:
@@ -500,43 +529,43 @@ def process_turn(text: str) -> None:
 
         # mute mic while jarvis talks so we don't loop
         stt.mute()
-        _inc_metric("stt_muted_for_tts")
+        inc_metric("stt_muted_for_tts")
         try:
             tts.say(reply, wait=True, wait_timeout=30.0)
-            _inc_metric("tts_speak_requests")
+            inc_metric("tts_speak_requests")
         except Exception as e:
-            _inc_metric("tts_speak_failures")
+            inc_metric("tts_speak_failures")
             log.exception("TTS playback failed: %s", e)
         finally:
             time.sleep(POST_SPEECH_MUTE_HOLD)
             with last_reply_lock:
                 last_reply_time = time.monotonic()
             stt.unmute()
-            _inc_metric("stt_unmuted_after_tts")
+            inc_metric("stt_unmuted_after_tts")
     finally:
         turn_elapsed_ms = (time.monotonic() - turn_started) * 1000
-        _observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "voice_turns_completed", turn_elapsed_ms)
+        observe_latency("turn_last_latency_ms", "turn_avg_latency_ms", "voice_turns_completed", turn_elapsed_ms)
         turn_lock.release()
 
 
 def handle_final(text: str) -> None:
     """STT finished a phrase — don't block here."""
-    _inc_metric("stt_final_callbacks")
+    inc_metric("stt_final_callbacks")
     if not text or not text.strip():
-        _inc_metric("stt_final_empty")
+        inc_metric("stt_final_empty")
         return
     if stt.is_muted:
-        _inc_metric("stt_final_dropped_muted")
+        inc_metric("stt_final_dropped_muted")
         log.debug("Dropping transcript received while muted: %s", text)
         return
 
     cleaned = text.strip()
     if looks_like_echo(cleaned):
-        _inc_metric("stt_final_dropped_echo")
+        inc_metric("stt_final_dropped_echo")
         log.info("Dropping suspected echo of Jarvis's reply: %s", cleaned)
         return
 
-    _inc_metric("stt_final_dispatched")
+    inc_metric("stt_final_dispatched")
     threading.Thread(
         target=process_turn,
         args=(cleaned,),
@@ -551,7 +580,7 @@ stt.on_final = handle_final
 if __name__ == "__main__":
     try:
         tts.start()
-        tts.say("Hello Niloy, What's the plan today", wait=True, wait_timeout=30.0)
+        tts.say("Hello sir. All systems are online and functioning within normal parameters.", wait=True, wait_timeout=30.0)
         stt.start()
         log.info("Jarvis is listening. Press Ctrl-C to stop.")
         while True:
